@@ -26,6 +26,7 @@ a rendered video, or a single frame.
 
 # Standard library
 from pathlib import Path
+import time
 from typing import Literal
 
 # Third-party libraries
@@ -33,12 +34,19 @@ import mujoco as mj
 import numpy as np
 import numpy.typing as npt
 from mujoco import viewer
+import sys
 
 # Local libraries (ARIEL)
 from ariel import console
 from ariel.body_phenotypes.robogen_lite.modules.core import CoreModule
-from ariel.body_phenotypes.robogen_lite.prebuilt_robots.gecko import gecko
-from ariel.ec import set_seed
+from ariel.body_phenotypes.robogen_lite.prebuilt_robots.john_set import (
+    gecko,
+    snake,
+    turtle,
+    spider_8,
+    centipede_3,
+)
+from ariel.ec import EA, EAOperation, FloatMutator, Individual, Population, set_seed
 from ariel.simulation.environments import SimpleFlatWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.runners import simple_runner
@@ -50,7 +58,7 @@ type ViewerTypes = Literal["launcher", "video", "simple", "frame", "no_control"]
 # --- RANDOM GENERATOR SETUP --- #
 # Fix the seed while you are debugging.
 # Report results over MULTIPLE seeds.
-SEED = 42
+SEED = int(sys.argv[1]) if len(sys.argv) > 1 else 42
 RNG = np.random.default_rng(SEED)
 
 # ariel.ec's own generators/mutators/crossover draw from a separate,
@@ -68,7 +76,7 @@ DATA.mkdir(parents=True, exist_ok=True)
 SPAWN_POS: list[float] = [0.0, 0.0, 0.1]  # where the robot starts
 TARGET_POSITION: list[float] = [2.0, 0.0, 0.1]  # where it should end up
 SIM_DURATION: float = 15.0  # seconds of simulated time per evaluation
-MODE: ViewerTypes = "launcher"  # see run_experiment() for the options
+MODE: ViewerTypes = "simple"  # see run_experiment() for the options
 
 
 # ============================================================================ #
@@ -130,6 +138,16 @@ def build_robot() -> CoreModule:
 
 # Controller architecture - decide before writing your EA.
 HIDDEN_SIZE: int = 6
+BEAT_FREQ: float = 1.0    # beats per second
+USE_DIRECTION: bool = True
+N_EXTRA: int = 4 if USE_DIRECTION else 2
+POP_SIZE: int = 20
+GENERATIONS: int = 500    # 3 for the test, 500 for the final runs
+ALGO: str = sys.argv[2] if len(sys.argv) > 2 else "0.5"
+RANDOM_SEARCH: bool = ALGO == "random"
+SIGMA: float = 0.0 if RANDOM_SEARCH else float(ALGO)
+CONFIG: str = "random" if RANDOM_SEARCH else f"sigma{SIGMA}"
+HISTORY: list = []
 
 
 def nn_controller(
@@ -163,7 +181,14 @@ def nn_controller(
     # --- INPUTS ---------------------------------------------------------- #
     # Bare qpos - the simplest choice, not necessarily a good one. See
     # YOUR JOB below.
-    inputs = data.qpos
+    t = data.time                                      # the simulation's clock, in seconds
+    beat = [np.sin(2 * np.pi * BEAT_FREQ * t),
+            np.cos(2 * np.pi * BEAT_FREQ * t)]
+    to_target = np.array(TARGET_POSITION[:2]) - data.qpos[0:2]   # GPS: (dx, dy) to the target
+    parts = [data.qpos, beat]
+    if USE_DIRECTION:
+        parts.append(to_target)
+    inputs = np.concatenate(parts)
 
     # --- FORWARD PASS ----------------------------------------------------- #
     layer1 = np.tanh(inputs @ w1)
@@ -190,6 +215,13 @@ def make_random_weights(
         RNG.normal(scale=0.5, size=(input_size, HIDDEN_SIZE)),
         RNG.normal(scale=0.5, size=(HIDDEN_SIZE, output_size)),
     ]
+
+def unflatten(genome, input_size, output_size):
+    """Pack a flat genome into the two weight matrices [w1, w2]."""
+    n1 = input_size * HIDDEN_SIZE                                     # how many eggs fit in carton 1?
+    w1 = genome[:n1].reshape(input_size, HIDDEN_SIZE)           # carton 1: inputs -> mixers
+    w2 = genome[n1:].reshape(HIDDEN_SIZE, output_size)           # carton 2: mixers -> motors
+    return [w1, w2]
 
 
 # ============================================================================ #
@@ -235,7 +267,7 @@ def fitness_function(
 # ============================================================================ #
 
 
-def run_experiment(mode: ViewerTypes = MODE) -> float:
+def run_experiment(genome, mode: ViewerTypes = MODE) -> float:
     """Set up the world, run one simulation, and return the fitness.
 
     This is the function your EA calls once per individual, with `mode` set
@@ -270,10 +302,10 @@ def run_experiment(mode: ViewerTypes = MODE) -> float:
     # --- Wire up the controller -------------------------------------------- #
     # Sizes are read from the compiled model, never hardcoded - they depend on
     # the body you chose in build_robot().
-    input_size = len(data.qpos)
+    input_size = len(data.qpos) + N_EXTRA
     output_size = model.nu
 
-    weights = make_random_weights(input_size, output_size)
+    weights = unflatten(genome, input_size, output_size)
 
     def control_callback(m: mj.MjModel, d: mj.MjData) -> None:
         """Compute and apply actions; MuJoCo calls this every physics step."""
@@ -326,13 +358,72 @@ def run_experiment(mode: ViewerTypes = MODE) -> float:
     final_position = get_core_position(data)
     fitness = fitness_function(initial_position, final_position)
 
-    console.log(f"start  : {np.round(initial_position, 3)}")
-    console.log(f"end    : {np.round(final_position, 3)}")
-    console.log(f"target : {np.round(TARGET_POSITION, 3)}")
-    console.log(f"fitness: {fitness:.4f}   (lower is better)")
+    # console.log(f"start  : {np.round(initial_position, 3)}")
+    # console.log(f"end    : {np.round(final_position, 3)}")
+    # console.log(f"target : {np.round(TARGET_POSITION, 3)}")
+    # console.log(f"fitness: {fitness:.4f}   (lower is better)")
 
     return fitness
 
+
+def make_individual(num_weights: int) -> Individual:
+    ind = Individual()
+    ind.genotype = RNG.normal(scale=0.5, size=num_weights).tolist()
+    return ind
+
+
+def evaluate(population: Population) -> Population:
+    # Only simulate individuals that don't have a fitness yet.
+    for ind in population.unevaluated:
+        ind.fitness = run_experiment(np.array(ind.genotype), MODE)
+    return population
+
+
+def parent_selection(population: Population) -> Population:
+    # Best half of the living population become parents.
+    ranked = population.alive.sort(sort="min")
+    for i, ind in enumerate(ranked):
+        ind.tags = {"parent": i < len(ranked) // 2}
+    return population
+
+
+def reproduce(population: Population) -> Population:
+    # POP_SIZE children: copy a random parent, nudge every weight.
+    parents = population.where(lambda ind: bool(ind.tags.get("parent", False)))
+    for _ in range(POP_SIZE):
+        p = parents[int(RNG.integers(len(parents)))]
+        child = Individual()
+        child.genotype = FloatMutator.gaussian(p.genotype, std=SIGMA, mutation_probability=1.0)
+        population.append(child)
+    return population
+
+
+def survivor_selection(population: Population) -> Population:
+    # Parents + children compete; only the best POP_SIZE stay alive.
+    ranked = population.alive.sort(sort="min")
+    for ind in ranked[POP_SIZE:]:
+        ind.alive = False
+    return population
+
+
+def record(population: Population) -> Population:
+    fits = [ind.fitness for ind in population.alive]
+    gen = len(HISTORY)
+    HISTORY.append((gen, min(fits), float(np.mean(fits))))
+    print(f"gen {gen:3d}   best {min(fits):.4f}   mean {float(np.mean(fits)):.4f}")
+    return population
+
+def random_search(num_weights: int) -> None:
+    """Same budget as the EA: GENERATIONS + 1 blocks of POP_SIZE random brains."""
+    best_so_far = float("inf")
+    for gen in range(GENERATIONS + 1):
+        fits = [
+            run_experiment(RNG.normal(scale=0.5, size=num_weights), MODE)
+            for _ in range(POP_SIZE)
+        ]
+        best_so_far = min(best_so_far, min(fits))
+        HISTORY.append((gen, best_so_far, float(np.mean(fits))))
+        print(f"block {gen:3d}   best so far {best_so_far:.4f}   block mean {float(np.mean(fits)):.4f}")
 
 def main() -> None:
     """Run a single demo evaluation with a randomly-weighted controller."""
@@ -348,7 +439,7 @@ def main() -> None:
     model = world.spec.compile()
     data = mj.MjData(model)
 
-    input_size = len(data.qpos)
+    input_size = len(data.qpos) + N_EXTRA
     output_size = model.nu
     num_weights = (
         input_size * HIDDEN_SIZE
@@ -358,7 +449,36 @@ def main() -> None:
     console.log(f"controller outputs (model.nu)      : {output_size}")
     console.log(f"genotype length (total weights)    : {num_weights}")
 
-    run_experiment(MODE)
+    if RANDOM_SEARCH:
+        random_search(num_weights)
+    else:
+        initial = Population([make_individual(num_weights) for _ in range(POP_SIZE)])
+        initial = evaluate(initial)
+        record(initial)
+
+        ops = [
+            EAOperation(parent_selection),
+            EAOperation(reproduce),
+            EAOperation(evaluate),
+            EAOperation(survivor_selection),
+            EAOperation(record),
+        ]
+        ea = EA(
+            initial,
+            ops,
+            num_steps=GENERATIONS,
+            is_maximisation=False,
+            db_file_path=DATA / f"{CONFIG}_seed{SEED}.db",
+            quiet=False,
+        )
+        ea.run()
+
+    out = DATA / f"{CONFIG}_seed{SEED}.csv"
+    with open(out, "w") as fh:
+        fh.write("generation,best,mean\n")
+        for gen, b, m in HISTORY:
+            fh.write(f"{gen},{b},{m}\n")
+    print("saved", out)
 
 
 if __name__ == "__main__":
